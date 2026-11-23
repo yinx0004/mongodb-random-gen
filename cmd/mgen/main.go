@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -39,6 +41,12 @@ const (
 
 // errInterrupted is returned after Ctrl-C; the message has already been printed.
 var errInterrupted = errors.New("interrupted")
+
+// stderrMu serializes the progress bar and retry messages written by workers.
+var stderrMu sync.Mutex
+
+// retries counts batch retries of the collection being written.
+var retries atomic.Int64
 
 func main() {
 	root := newRoot()
@@ -158,7 +166,7 @@ func isTerminal(f *os.File) bool {
 // ---------------------------------------------------------------------------
 
 func newRun() *cobra.Command {
-	var count, batch, workers int
+	var count, batch, workers, maxRetries int
 	var uri, db, out, locale, wcFlag string
 	var drop bool
 	cmd := &cobra.Command{
@@ -182,9 +190,13 @@ func newRun() *cobra.Command {
 			if workers < 1 {
 				return i18n.Errorf("--workers 至少为 1", "--workers must be at least 1")
 			}
+			if maxRetries < 0 {
+				return i18n.Errorf("--retries 不能为负数", "--retries must not be negative")
+			}
 
 			var s sink.Sink
 			var dir *sink.JSONLDir
+			var hintURI string // set when writing to MongoDB, for timeout hints
 			if out != "" {
 				fi, statErr := os.Stat(out)
 				isDir := strings.HasSuffix(out, "/") || (statErr == nil && fi.IsDir()) || filepath.Ext(out) == ""
@@ -210,17 +222,19 @@ func newRun() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				m, err := sink.ConnectMongo(u, dbName, wc)
+				m, err := sink.ConnectMongo(u, dbName, sink.MongoOptions{
+					WriteConcern: wc, Workers: workers, Retries: maxRetries, OnRetry: printRetry,
+				})
 				if err != nil {
 					return sink.ErrConnect(u, err)
 				}
-				s = m
+				s, hintURI = m, u
 			}
 
 			start := time.Now()
 			for _, c := range colls {
 				opt := runner.Options{Workers: workers, Batch: batch, Seed: rand.Uint64()}
-				if err := writeCollection(cmd.Context(), s, dbName, c, drop || c.coll.Drop, out == "", opt); err != nil {
+				if err := writeCollection(cmd.Context(), s, dbName, c, drop || c.coll.Drop, hintURI, opt); err != nil {
 					s.Close()
 					return err
 				}
@@ -254,6 +268,8 @@ func newRun() *cobra.Command {
 	f.StringVar(&locale, "locale", "", i18n.T("覆盖配置里的 locale：zh | en | mixed", "override the config locale: zh | en | mixed"))
 	f.IntVar(&batch, "batch", 1000, i18n.T("每批写入条数", "documents per insert batch"))
 	f.IntVarP(&workers, "workers", "w", defaultWorkers, i18n.T("并发写入的 worker 数", "number of concurrent writers"))
+	f.IntVar(&maxRetries, "retries", 5, i18n.T("一批遇到网络错误或超时时最多重试几次（间隔约 1s、2s、4s、8s、15s，共约 30s，足够等副本集选主）",
+		"retries per batch on network errors or timeouts (about 1s, 2s, 4s, 8s, 15s: ~30s in total, enough for a replica set election)"))
 	f.StringVar(&wcFlag, "write-concern", "1", i18n.T(
 		"写入确认级别：1（默认，主节点确认即返回）| majority（等多数节点）| 0（不等确认，失败不会报告）。连接串里写了 w= 时以连接串为准，除非显式指定本参数",
 		"write concern: 1 (default, primary only) | majority | 0 (fire and forget, failures are not reported). A w= in the URI wins unless this flag is given"))
@@ -284,7 +300,20 @@ func writeConcern(flag string, explicit bool, uri string) (*writeconcern.WriteCo
 	return &writeconcern.WriteConcern{W: n}, nil
 }
 
-func writeCollection(ctx context.Context, s sink.Sink, dbName string, c compiled, drop, toDB bool, opt runner.Options) error {
+// printRetry reports a batch retry above the progress bar.
+func printRetry(coll string, attempt int, wait time.Duration, err error) {
+	retries.Add(1)
+	stderrMu.Lock()
+	defer stderrMu.Unlock()
+	fmt.Fprintf(os.Stderr, "\r\033[K%s\n", i18n.Tf("⚠ 写入 %s 出错，%.1fs 后第 %d 次重试：%s",
+		"⚠ writing %s failed, retrying in %.1fs (attempt %d): %s", coll, wait.Seconds(), attempt, clip(err.Error(), 160)))
+}
+
+// writeCollection writes one collection. uri is non-empty when writing to
+// MongoDB and is only used to explain timeouts.
+func writeCollection(ctx context.Context, s sink.Sink, dbName string, c compiled, drop bool, uri string, opt runner.Options) error {
+	toDB := uri != ""
+	retries.Store(0)
 	name, total := c.coll.Name, c.coll.Count
 	full := dbName + "." + name
 	if err := s.Begin(name, drop && toDB); err != nil {
@@ -297,6 +326,8 @@ func writeCollection(ctx context.Context, s sink.Sink, dbName string, c compiled
 	showProgress := isTerminal(os.Stderr) && total > 0
 	if showProgress {
 		opt.Progress = func(done int64) {
+			stderrMu.Lock()
+			defer stderrMu.Unlock()
 			pct := float64(done) * 100 / float64(total)
 			rate := float64(done) / max(time.Since(start).Seconds(), 1e-9)
 			bar := strings.Repeat("█", int(pct/4)) + strings.Repeat("░", 25-int(pct/4))
@@ -315,13 +346,23 @@ func writeCollection(ctx context.Context, s sink.Sink, dbName string, c compiled
 				fmt.Sprintf("interrupted: %s docs written to %s", written, full)))
 			return errInterrupted
 		}
-		return i18n.Errorf("写入 %s 失败（已写入 %s 条）：%v", "writing %s failed (%s docs written): %v", full, fmtInt(int(res.Done-res.Failed)), err)
+		msg := i18n.Tf("写入 %s 失败（已写入 %s 条）：%v", "writing %s failed (%s docs written): %v", full, fmtInt(int(res.Done-res.Failed)), err)
+		if re := (*sink.RetryError)(nil); errors.As(err, &re) {
+			msg += i18n.Tf("\n（这一批已重试 %d 次仍失败）", "\n(this batch still failed after %d retries)", re.Retries)
+		}
+		if h := sink.Hint(uri, err); toDB && h != "" {
+			msg += "\n" + h
+		}
+		return errors.New(msg)
 	}
 	el := time.Since(start)
 	rate := float64(total) / max(el.Seconds(), 1e-9)
 	msg := i18n.Tf("✓ %s  %s 条  %.1fs  (%s 条/秒)", "✓ %s  %s docs  %.1fs  (%s docs/s)", full, fmtInt(total), el.Seconds(), fmtInt(int(rate)))
 	if res.Failed > 0 {
 		msg += i18n.Tf("，其中 %s 条写入失败（通常是唯一索引冲突）", ", %s failed to insert (usually unique index conflicts)", fmtInt(int(res.Failed)))
+	}
+	if n := retries.Load(); n > 0 {
+		msg += i18n.Tf("，期间重试 %d 次", ", %d batch retries", n)
 	}
 	fmt.Fprintln(os.Stderr, msg)
 	return nil
@@ -395,9 +436,9 @@ func newTypes() *cobra.Command {
 				}
 				fmt.Printf("  %s\n      %s\n", head, i18n.T(t.DescZh, t.DescEn))
 				if t.Localized {
-					fmt.Printf("      zh: %s\n      en: %s\n", clip(gen.Example(t, gen.Zh, r)), clip(gen.Example(t, gen.En, r)))
+					fmt.Printf("      zh: %s\n      en: %s\n", clip(gen.Example(t, gen.Zh, r), 70), clip(gen.Example(t, gen.En, r), 70))
 				} else {
-					fmt.Printf("      %s %s\n", i18n.T("例:", "e.g."), clip(gen.Example(t, gen.Zh, r)))
+					fmt.Printf("      %s %s\n", i18n.T("例:", "e.g."), clip(gen.Example(t, gen.Zh, r), 70))
 				}
 			}
 			fmt.Print(i18n.T(`
@@ -427,9 +468,9 @@ func newTypes() *cobra.Command {
 	}
 }
 
-func clip(s string) string {
-	if r := []rune(s); len(r) > 70 {
-		return string(r[:67]) + "..."
+func clip(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n-3]) + "..."
 	}
 	return s
 }
