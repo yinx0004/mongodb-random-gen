@@ -16,6 +16,8 @@ users:
 
 ## 安装
 
+支持 MongoDB 4.0 及以上（已实测 4.0、4.4、7.0、8.0）。
+
 ```bash
 go install github.com/yinx0004/mongodb-random-gen/cmd/mgen@latest   # 需要 Go 1.25+，命令名为 mgen
 ```
