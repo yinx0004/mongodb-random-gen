@@ -77,11 +77,11 @@ func TestInitTemplates(t *testing.T) {
 			t.Fatalf("%s: %v", f, err)
 		}
 		for _, c := range cfg.Collections {
-			d, err := gen.CompileDoc(c.Fields, c.Name, c.Locale, 1)
+			d, err := gen.CompileDoc(c.Fields, c.Name, c.Locale)
 			if err != nil {
 				t.Fatalf("%s: %v", f, err)
 			}
-			d.Next()
+			d.Stream(1, 0).Next()
 		}
 	}
 }

@@ -85,12 +85,12 @@ func errAt(n *yaml.Node, path string, err error) *Error {
 	return &Error{Line: n.Line, Path: path, Msg: err.Error()}
 }
 
-// Doc generates whole documents for one collection.
+// Doc is the compiled template of one collection. It is read-only after
+// compilation and safe to share between goroutines; each goroutine draws
+// documents from its own Stream.
 type Doc struct {
 	mode   LocaleMode
 	fields []field
-	r      *rand.Rand
-	ctx    Ctx
 }
 
 type field struct {
@@ -99,7 +99,7 @@ type field struct {
 }
 
 // CompileDoc compiles the `fields` mapping of a collection.
-func CompileDoc(fields *yaml.Node, path string, mode LocaleMode, seed uint64) (*Doc, error) {
+func CompileDoc(fields *yaml.Node, path string, mode LocaleMode) (*Doc, error) {
 	fs, err := compileFields(fields, path)
 	if err != nil {
 		return nil, err
@@ -113,21 +113,35 @@ func CompileDoc(fields *yaml.Node, path string, mode LocaleMode, seed uint64) (*
 	if !hasID {
 		fs = append([]field{{"_id", func(*Ctx) any { return bson.NewObjectID() }}}, fs...)
 	}
-	r := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
-	return &Doc{mode: mode, fields: fs, r: r, ctx: Ctx{R: r}}, nil
+	return &Doc{mode: mode, fields: fs}, nil
+}
+
+// Stream is a deterministic sequence of documents from one Doc. A Stream is
+// not safe for concurrent use; give every goroutine its own.
+type Stream struct {
+	doc *Doc
+	r   *rand.Rand
+	ctx Ctx
+}
+
+// Stream returns a document stream seeded by (seed, part). The same pair
+// always yields the same documents, apart from generated ObjectIds and `now`.
+func (d *Doc) Stream(seed, part uint64) *Stream {
+	r := rand.New(rand.NewPCG(seed, part^0x9e3779b97f4a7c15))
+	return &Stream{doc: d, r: r, ctx: Ctx{R: r}}
 }
 
 // Next generates one document.
-func (d *Doc) Next() bson.D {
-	switch d.mode {
+func (s *Stream) Next() bson.D {
+	switch s.doc.mode {
 	case ModeEn:
-		d.ctx.Loc = En
+		s.ctx.Loc = En
 	case ModeMixed:
-		d.ctx.Loc = Locale(d.r.IntN(2))
+		s.ctx.Loc = Locale(s.r.IntN(2))
 	default:
-		d.ctx.Loc = Zh
+		s.ctx.Loc = Zh
 	}
-	return buildDoc(&d.ctx, d.fields)
+	return buildDoc(&s.ctx, s.doc.fields)
 }
 
 func buildDoc(c *Ctx, fs []field) bson.D {

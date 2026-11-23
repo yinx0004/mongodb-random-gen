@@ -25,18 +25,18 @@ func fields(t *testing.T, src string) *yaml.Node {
 	return n.Content[0]
 }
 
-func doc(t *testing.T, src string, mode LocaleMode) *Doc {
+func doc(t *testing.T, src string, mode LocaleMode) *Stream {
 	t.Helper()
-	d, err := CompileDoc(fields(t, src), "c", mode, 42)
+	d, err := CompileDoc(fields(t, src), "c", mode)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
-	return d
+	return d.Stream(42, 0)
 }
 
 func compileErr(t *testing.T, src string) string {
 	t.Helper()
-	_, err := CompileDoc(fields(t, src), "c", ModeZh, 1)
+	_, err := CompileDoc(fields(t, src), "c", ModeZh)
 	if err == nil {
 		t.Fatalf("expected an error for %q", src)
 	}

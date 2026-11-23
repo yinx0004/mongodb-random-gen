@@ -2,20 +2,28 @@
 package main
 
 import (
+	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"math/rand/v2"
+	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 
 	"github.com/yinx0004/mongodb-random-gen/internal/config"
 	"github.com/yinx0004/mongodb-random-gen/internal/gen"
 	"github.com/yinx0004/mongodb-random-gen/internal/i18n"
+	"github.com/yinx0004/mongodb-random-gen/internal/runner"
 	"github.com/yinx0004/mongodb-random-gen/internal/sink"
 )
 
@@ -24,7 +32,13 @@ var version = "0.1.0"
 //go:embed templates/*.yaml
 var templates embed.FS
 
-const defaultURI = "mongodb://localhost:27017"
+const (
+	defaultURI     = "mongodb://localhost:27017"
+	defaultWorkers = 8
+)
+
+// errInterrupted is returned after Ctrl-C; the message has already been printed.
+var errInterrupted = errors.New("interrupted")
 
 func main() {
 	root := newRoot()
@@ -41,7 +55,16 @@ func main() {
 			os.Args = append([]string{os.Args[0], "run"}, os.Args[1:]...)
 		}
 	}
-	if err := root.Execute(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		stop() // first Ctrl-C finishes in-flight batches; a second one exits immediately
+	}()
+	if err := root.ExecuteContext(ctx); err != nil {
+		if errors.Is(err, errInterrupted) {
+			os.Exit(130)
+		}
 		fmt.Fprintln(os.Stderr, i18n.T("错误：", "error: ")+err.Error())
 		os.Exit(1)
 	}
@@ -95,7 +118,7 @@ func load(path, locale string) (*config.Config, []compiled, error) {
 	}
 	var out []compiled
 	for _, c := range cfg.Collections {
-		d, err := gen.CompileDoc(c.Fields, c.Name, c.Locale, rand.Uint64())
+		d, err := gen.CompileDoc(c.Fields, c.Name, c.Locale)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -135,8 +158,8 @@ func isTerminal(f *os.File) bool {
 // ---------------------------------------------------------------------------
 
 func newRun() *cobra.Command {
-	var count, batch int
-	var uri, db, out, locale string
+	var count, batch, workers int
+	var uri, db, out, locale, wcFlag string
 	var drop bool
 	cmd := &cobra.Command{
 		Use:   "run <config.yaml>",
@@ -155,6 +178,9 @@ func newRun() *cobra.Command {
 			}
 			if batch < 1 {
 				batch = 1000
+			}
+			if workers < 1 {
+				return i18n.Errorf("--workers 至少为 1", "--workers must be at least 1")
 			}
 
 			var s sink.Sink
@@ -180,7 +206,11 @@ func newRun() *cobra.Command {
 				}
 			} else {
 				u := firstNonEmpty(uri, cfg.URI, os.Getenv("MONGO_URI"), defaultURI)
-				m, err := sink.ConnectMongo(u, dbName)
+				wc, err := writeConcern(wcFlag, cmd.Flags().Changed("write-concern"), u)
+				if err != nil {
+					return err
+				}
+				m, err := sink.ConnectMongo(u, dbName, wc)
 				if err != nil {
 					return sink.ErrConnect(u, err)
 				}
@@ -189,7 +219,8 @@ func newRun() *cobra.Command {
 
 			start := time.Now()
 			for _, c := range colls {
-				if err := writeCollection(s, dbName, c, drop || c.coll.Drop, out == "", batch); err != nil {
+				opt := runner.Options{Workers: workers, Batch: batch, Seed: rand.Uint64()}
+				if err := writeCollection(cmd.Context(), s, dbName, c, drop || c.coll.Drop, out == "", opt); err != nil {
 					s.Close()
 					return err
 				}
@@ -222,10 +253,38 @@ func newRun() *cobra.Command {
 		"write JSON Lines instead of MongoDB: a directory gets one file per collection, a .jsonl path takes a single collection, - is stdout"))
 	f.StringVar(&locale, "locale", "", i18n.T("覆盖配置里的 locale：zh | en | mixed", "override the config locale: zh | en | mixed"))
 	f.IntVar(&batch, "batch", 1000, i18n.T("每批写入条数", "documents per insert batch"))
+	f.IntVarP(&workers, "workers", "w", defaultWorkers, i18n.T("并发写入的 worker 数", "number of concurrent writers"))
+	f.StringVar(&wcFlag, "write-concern", "1", i18n.T(
+		"写入确认级别：1（默认，主节点确认即返回）| majority（等多数节点）| 0（不等确认，失败不会报告）。连接串里写了 w= 时以连接串为准，除非显式指定本参数",
+		"write concern: 1 (default, primary only) | majority | 0 (fire and forget, failures are not reported). A w= in the URI wins unless this flag is given"))
 	return cmd
 }
 
-func writeCollection(s sink.Sink, dbName string, c compiled, drop, toDB bool, batch int) error {
+// writeConcern decides the write concern: an explicit flag wins, then a w= in
+// the URI (nil keeps it), then w:1. MongoDB 5.0+ replica sets default to
+// majority, which is much slower for bulk loading test data.
+func writeConcern(flag string, explicit bool, uri string) (*writeconcern.WriteConcern, error) {
+	if !explicit {
+		if u, err := url.Parse(uri); err == nil {
+			for k := range u.Query() {
+				if strings.EqualFold(k, "w") {
+					return nil, nil
+				}
+			}
+		}
+		return writeconcern.W1(), nil
+	}
+	if strings.EqualFold(flag, "majority") {
+		return writeconcern.Majority(), nil
+	}
+	n, err := strconv.Atoi(flag)
+	if err != nil || n < 0 {
+		return nil, i18n.Errorf("--write-concern 只能是 majority 或非负整数，收到 %q", "--write-concern must be majority or a non-negative integer, got %q", flag)
+	}
+	return &writeconcern.WriteConcern{W: n}, nil
+}
+
+func writeCollection(ctx context.Context, s sink.Sink, dbName string, c compiled, drop, toDB bool, opt runner.Options) error {
 	name, total := c.coll.Name, c.coll.Count
 	full := dbName + "." + name
 	if err := s.Begin(name, drop && toDB); err != nil {
@@ -234,40 +293,35 @@ func writeCollection(s sink.Sink, dbName string, c compiled, drop, toDB bool, ba
 	if drop && toDB {
 		fmt.Fprintln(os.Stderr, i18n.Tf("已清空 %s", "dropped %s", full))
 	}
-	progress := isTerminal(os.Stderr)
-	start, last := time.Now(), time.Time{}
-	done, failed := 0, 0
-	buf := make([]any, 0, batch)
-	for done < total {
-		n := min(batch, total-done)
-		buf = buf[:0]
-		for i := 0; i < n; i++ {
-			buf = append(buf, c.doc.Next())
-		}
-		f, err := s.Write(buf)
-		if err != nil {
-			if progress {
-				fmt.Fprintln(os.Stderr)
-			}
-			return i18n.Errorf("写入 %s 失败：%v", "writing %s failed: %v", full, err)
-		}
-		failed += f
-		done += n
-		if progress && (time.Since(last) > 200*time.Millisecond || done == total) {
-			last = time.Now()
+	start := time.Now()
+	showProgress := isTerminal(os.Stderr) && total > 0
+	if showProgress {
+		opt.Progress = func(done int64) {
 			pct := float64(done) * 100 / float64(total)
+			rate := float64(done) / max(time.Since(start).Seconds(), 1e-9)
 			bar := strings.Repeat("█", int(pct/4)) + strings.Repeat("░", 25-int(pct/4))
-			fmt.Fprintf(os.Stderr, "\r%s %s %5.1f%%  %s/%s ", full, bar, pct, fmtInt(done), fmtInt(total))
+			fmt.Fprintf(os.Stderr, "\r\033[K%s %s %5.1f%%  %s/%s  %s%s",
+				full, bar, pct, fmtInt(int(done)), fmtInt(total), fmtInt(int(rate)), i18n.T(" 条/秒", " docs/s"))
 		}
 	}
-	if progress && total > 0 {
+	res, err := runner.Run(ctx, s, c.doc, total, opt)
+	if showProgress {
 		fmt.Fprint(os.Stderr, "\r\033[K")
+	}
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			written := fmtInt(int(res.Done - res.Failed))
+			fmt.Fprintln(os.Stderr, i18n.T(fmt.Sprintf("已中断：%s 已写入 %s 条", full, written),
+				fmt.Sprintf("interrupted: %s docs written to %s", written, full)))
+			return errInterrupted
+		}
+		return i18n.Errorf("写入 %s 失败（已写入 %s 条）：%v", "writing %s failed (%s docs written): %v", full, fmtInt(int(res.Done-res.Failed)), err)
 	}
 	el := time.Since(start)
 	rate := float64(total) / max(el.Seconds(), 1e-9)
 	msg := i18n.Tf("✓ %s  %s 条  %.1fs  (%s 条/秒)", "✓ %s  %s docs  %.1fs  (%s docs/s)", full, fmtInt(total), el.Seconds(), fmtInt(int(rate)))
-	if failed > 0 {
-		msg += i18n.Tf("，其中 %s 条写入失败（通常是唯一索引冲突）", ", %s failed to insert (usually unique index conflicts)", fmtInt(failed))
+	if res.Failed > 0 {
+		msg += i18n.Tf("，其中 %s 条写入失败（通常是唯一索引冲突）", ", %s failed to insert (usually unique index conflicts)", fmtInt(int(res.Failed)))
 	}
 	fmt.Fprintln(os.Stderr, msg)
 	return nil
@@ -295,10 +349,11 @@ func newPreview() *cobra.Command {
 					fmt.Println()
 				}
 				k := min(n, c.coll.Count)
+				stream := c.doc.Stream(rand.Uint64(), 0)
 				fmt.Println(i18n.Tf("// %s.%s：预览 %d 条（实际会生成 %s 条）", "// %s.%s: %d sample(s), %s will be generated",
 					dbName, c.coll.Name, k, fmtInt(c.coll.Count)))
 				for j := 0; j < k; j++ {
-					b, err := bson.MarshalExtJSONIndent(c.doc.Next(), false, false, "", "  ")
+					b, err := bson.MarshalExtJSONIndent(stream.Next(), false, false, "", "  ")
 					if err != nil {
 						return err
 					}

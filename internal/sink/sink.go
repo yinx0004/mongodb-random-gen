@@ -3,25 +3,31 @@ package sink
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 
 	"github.com/yinx0004/mongodb-random-gen/internal/i18n"
 )
 
 // Sink receives batches of documents for one collection at a time.
+//
+// Begin is called while no writes are in flight. After Begin returns, Write
+// may be called from many goroutines at once.
 type Sink interface {
 	Begin(coll string, drop bool) error
-	Write(docs []any) (failed int, err error)
+	Write(ctx context.Context, docs []any) (failed int, err error)
 	Close() error
 }
 
@@ -35,8 +41,14 @@ type Mongo struct {
 	coll   *mongo.Collection
 }
 
-func ConnectMongo(uri, db string) (*Mongo, error) {
-	client, err := mongo.Connect(options.Client().ApplyURI(uri).SetServerSelectionTimeout(5 * time.Second))
+// ConnectMongo connects and pings. A nil wc keeps whatever the URI (or the
+// server default) says.
+func ConnectMongo(uri, db string, wc *writeconcern.WriteConcern) (*Mongo, error) {
+	opts := options.Client().ApplyURI(uri).SetServerSelectionTimeout(5 * time.Second)
+	if wc != nil {
+		opts.SetWriteConcern(wc)
+	}
+	client, err := mongo.Connect(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -57,8 +69,8 @@ func (m *Mongo) Begin(coll string, drop bool) error {
 	return nil
 }
 
-func (m *Mongo) Write(docs []any) (int, error) {
-	_, err := m.coll.InsertMany(context.Background(), docs, options.InsertMany().SetOrdered(false))
+func (m *Mongo) Write(ctx context.Context, docs []any) (int, error) {
+	_, err := m.coll.InsertMany(ctx, docs, options.InsertMany().SetOrdered(false))
 	if err == nil {
 		return 0, nil
 	}
@@ -76,6 +88,7 @@ func (m *Mongo) Close() error { return m.client.Disconnect(context.Background())
 // ---------------------------------------------------------------------------
 
 type JSONL struct {
+	mu     sync.Mutex
 	w      *bufio.Writer
 	closer io.Closer
 }
@@ -86,16 +99,21 @@ func NewJSONL(w io.Writer, closer io.Closer) *JSONL {
 
 func (j *JSONL) Begin(string, bool) error { return nil }
 
-func (j *JSONL) Write(docs []any) (int, error) {
+// Write encodes outside the lock so concurrent callers encode in parallel.
+func (j *JSONL) Write(_ context.Context, docs []any) (int, error) {
+	var buf bytes.Buffer
 	for _, d := range docs {
 		b, err := bson.MarshalExtJSON(d, false, false)
 		if err != nil {
 			return 0, err
 		}
-		j.w.Write(b)
-		j.w.WriteByte('\n')
+		buf.Write(b)
+		buf.WriteByte('\n')
 	}
-	return 0, nil
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	_, err := j.w.Write(buf.Bytes())
+	return 0, err
 }
 
 func (j *JSONL) Close() error {
@@ -132,7 +150,7 @@ func (d *JSONLDir) Begin(coll string, _ bool) error {
 	return nil
 }
 
-func (d *JSONLDir) Write(docs []any) (int, error) { return d.cur.Write(docs) }
+func (d *JSONLDir) Write(ctx context.Context, docs []any) (int, error) { return d.cur.Write(ctx, docs) }
 
 func (d *JSONLDir) Close() error { return d.closeCur() }
 
