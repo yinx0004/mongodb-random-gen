@@ -1,0 +1,39 @@
+# mgen example config: write each field as `field: type`
+#   preview (no database): mgen preview mgen.yaml
+#   write to MongoDB:      mgen mgen.yaml
+#   list all types:        mgen types
+
+db: test            # database name; --db also works
+locale: en          # zh Chinese | en English | mixed: each document is randomly zh or en
+
+users:              # collection name
+  count: 1000       # how many documents
+  fields:
+    name: name                    # Emma Smith / 张伟 (follows locale)
+    chineseName: name_zh          # add _zh / _en to pin the language
+    gender: gender
+    age: 18..60                   # integer range
+    phone: phone
+    email: email
+    address: address              # full street address
+    balance: 0..10000.00          # decimal range; decimal places are kept (2 here)
+    level: [normal 80%, vip 15%, svip 5%]   # weighted choice
+    status: [active, inactive]    # equal-chance choice
+    source: [app]                 # constant: a list with one value
+    version: 2                    # numbers, true/false and null are constants
+    vip: bool                     # random true / false
+    profile:                      # sub-document: just indent
+      company: company
+      job: job
+      city: city
+      bio: text 10..50            # a sentence of 10-50 characters
+    createdAt: 2023-01-01..now    # time range; -30d..now, -6mo..now, -1y..now work too
+
+orders:             # as many collections as you like
+  count: 5000
+  fields:
+    orderNo: uuid
+    amount: 9.9..999.00
+    status: [paid, shipped, refunded 5%]   # unweighted values share the rest
+    shipTo: address
+    createdAt: -90d..now

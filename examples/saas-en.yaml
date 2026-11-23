@@ -1,0 +1,34 @@
+# SaaS example in English: accounts and audit events
+# mgen preview examples/saas-en.yaml
+# mgen examples/saas-en.yaml --drop
+
+db: saas
+locale: en
+
+accounts:
+  count: 5000
+  fields:
+    company: company
+    domain: domain
+    plan: [free 70%, pro 25%, enterprise 5%]
+    seats: 1..500
+    mrr: 0..20000.00
+    owner:
+      name: name
+      email: email
+      phone: phone
+      title: job
+    billingAddress: address
+    active: bool
+    createdAt: -2y..now
+
+events:
+  count: 100000
+  locale: mixed        # half the events come from zh users, half from en users
+  fields:
+    actor: username
+    action: [login 50%, view 30%, update 15%, delete 5%]
+    ip: ip
+    userAgent: user_agent
+    at: -30d..now
+    at_ms: timestamp_ms

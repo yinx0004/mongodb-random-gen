@@ -1,0 +1,53 @@
+# 电商场景：用户、商品、订单
+# mgen preview examples/ecommerce.yaml
+# mgen examples/ecommerce.yaml --drop
+
+db: shop
+locale: zh
+
+users:
+  count: 10000
+  fields:
+    name: name
+    gender: gender
+    birthday: 1970-01-01..2006-12-31
+    phone: phone
+    email: email
+    idCard: id_card
+    level: [普通 85%, 银卡 10%, 金卡 5%]
+    points: 0..50000
+    address:
+      province: province
+      city: city
+      detail: address
+      zipcode: zipcode
+      location: point
+    registeredAt: -3y..now
+    lastLoginIp: ip
+    device: user_agent
+
+products:
+  count: 2000
+  fields:
+    sku: uuid
+    title: text 8..20
+    category: [手机, 电脑, 家电, 服饰, 食品, 图书, 美妆]
+    price: 9.9..9999.00
+    stock: 0..5000
+    onSale: bool
+    description: paragraph
+    createdAt: -2y..now
+
+orders:
+  count: 50000
+  fields:
+    orderNo: uuid
+    buyer:
+      name: name
+      phone: phone
+    amount: 9.9..20000.00
+    payMethod: [支付宝 50%, 微信支付 40%, 银行卡]
+    status: [待付款 10%, 已付款 20%, 已发货 30%, 已完成 35%, 已退款]
+    shipTo: address
+    remark: text 5..30
+    createdAt: -1y..now

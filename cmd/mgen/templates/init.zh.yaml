@@ -1,0 +1,40 @@
+# mgen 配置示例：每个字段写成「字段名: 类型」就行
+#   预览（不连库）：mgen preview mgen.yaml
+#   写入 MongoDB： mgen mgen.yaml
+#   查看全部类型：  mgen types
+
+db: test            # 数据库名，也可以用 --db 指定
+locale: zh          # zh 中文 | en 英文 | mixed 每条文档随机中文或英文
+
+users:              # 集合名
+  count: 1000       # 生成多少条
+  fields:
+    name: name                    # 姓名：张伟 / Emma Smith（跟随 locale）
+    englishName: name_en          # 加 _en / _zh 固定语言，不跟随 locale
+    gender: gender                # 男 / 女
+    age: 18..60                   # 整数范围
+    phone: phone                  # 手机号（真实号段）
+    email: email
+    idCard: id_card               # 身份证号（校验位正确）
+    address: address              # 完整地址：省市区 + 街道门牌
+    balance: 0..10000.00          # 小数范围，小数位数照抄（这里保留 2 位）
+    level: [normal 80%, vip 15%, svip 5%]   # 按权重选一个
+    status: [active, inactive]    # 等概率选一个
+    source: [app]                 # 固定值：写成只有一个元素的列表
+    version: 2                    # 数字、true/false、null 直接写就是固定值
+    vip: bool                     # 随机 true / false
+    profile:                      # 嵌套文档：直接往下缩进
+      company: company
+      job: job
+      city: city
+      bio: text 10..50            # 一句话，10~50 个字
+    createdAt: 2023-01-01..now    # 时间范围，也可写 -30d..now、-6mo..now、-1y..now
+
+orders:             # 可以写多个集合
+  count: 5000
+  fields:
+    orderNo: uuid
+    amount: 9.9..999.00
+    status: [paid, shipped, refunded 5%]   # 只写一部分权重，剩下的平分
+    shipTo: address
+    createdAt: -90d..now
