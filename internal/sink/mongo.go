@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/event"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -40,6 +41,9 @@ type Mongo struct {
 	db     *mongo.Database
 	coll   *mongo.Collection
 	opt    MongoOptions
+
+	// ServerVersion is the server's version string, e.g. "4.0.28" ("" if unknown).
+	ServerVersion string
 }
 
 // ConnectMongo connects, pings, and opens opt.Workers connections up front so
@@ -73,7 +77,56 @@ func ConnectMongo(uri, db string, opt MongoOptions) (*Mongo, error) {
 		return nil, err
 	}
 	w.wait(target, 30*time.Second)
-	return &Mongo{client: client, db: client.Database(db), opt: opt}, nil
+	return &Mongo{client: client, db: client.Database(db), opt: opt, ServerVersion: serverVersion(client)}, nil
+}
+
+func serverVersion(client *mongo.Client) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var info struct {
+		Version string `bson:"version"`
+	}
+	if err := client.Database("admin").RunCommand(ctx, bson.D{{Key: "buildInfo", Value: 1}}).Decode(&info); err != nil {
+		return ""
+	}
+	return info.Version
+}
+
+// legacyHeartbeat reports whether the server predates MongoDB 4.4. Those
+// servers have no streaming heartbeat, so the driver bounds every heartbeat
+// by connectTimeoutMS.
+func legacyHeartbeat(version string) bool {
+	major, rest, ok := strings.Cut(version, ".")
+	if !ok {
+		return false
+	}
+	minorStr, _, _ := strings.Cut(rest, ".")
+	ma, err1 := strconv.Atoi(major)
+	mi, err2 := strconv.Atoi(minorStr)
+	return err1 == nil && err2 == nil && (ma < 4 || ma == 4 && mi < 4)
+}
+
+// MinConnectTimeoutMS is the smallest connectTimeoutMS that mgen does not warn about.
+const MinConnectTimeoutMS = 10000
+
+// ConnectTimeoutWarning returns a warning when the URI sets a connectTimeoutMS
+// small enough to break a bulk load, or "". serverVersion may be empty.
+func ConnectTimeoutWarning(uri, serverVersion string) string {
+	ms, ok := uriOptions(uri)["connecttimeoutms"]
+	if !ok || ms <= 0 || ms >= MinConnectTimeoutMS {
+		return ""
+	}
+	msg := i18n.Tf(
+		"⚠ 连接串里 connectTimeoutMS=%d 偏小（建议不小于 %d，或去掉它用默认的 30000）。它限制每条新连接“建连 + 握手 + 认证”的总时间",
+		"⚠ connectTimeoutMS=%d in the URI is small (use at least %d, or drop it for the default 30000). It bounds connect + handshake + authentication of every new connection",
+		ms, MinConnectTimeoutMS)
+	if legacyHeartbeat(serverVersion) {
+		msg += i18n.Tf("；当前服务端是 MongoDB %s（低于 4.4），驱动的心跳超时也等于它",
+			"; this server is MongoDB %s (older than 4.4), so it is also the heartbeat timeout", serverVersion)
+	}
+	msg += i18n.T("。服务端繁忙时一旦超时，驱动会清空连接池、重建所有连接，写入可能变慢或出错（mgen 会自动重试）。",
+		". When it is exceeded on a busy server, the driver clears the pool and reconnects everything, so writes may slow down or fail (mgen retries them).")
+	return msg
 }
 
 func (m *Mongo) Begin(coll string, drop bool) error {

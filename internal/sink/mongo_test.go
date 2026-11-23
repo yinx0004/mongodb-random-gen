@@ -118,3 +118,31 @@ func TestRetryErrorUnwraps(t *testing.T) {
 		t.Fatal("RetryError must wrap the underlying error")
 	}
 }
+
+func TestLegacyHeartbeat(t *testing.T) {
+	cases := map[string]bool{"3.6.23": true, "4.0.28": true, "4.2.25": true, "4.4.0": false, "5.0.1": false, "8.0.4": false, "": false, "garbage": false}
+	for v, want := range cases {
+		if got := legacyHeartbeat(v); got != want {
+			t.Errorf("legacyHeartbeat(%q) = %v, want %v", v, got, want)
+		}
+	}
+}
+
+func TestConnectTimeoutWarning(t *testing.T) {
+	w := ConnectTimeoutWarning("mongodb://u:p@h/?connectTimeoutMS=2000", "4.0.28")
+	if !strings.Contains(w, "connectTimeoutMS=2000") || !strings.Contains(w, "4.0.28") || !strings.Contains(w, "心跳") {
+		t.Errorf("4.0 warning should mention the heartbeat:\n%s", w)
+	}
+	w = ConnectTimeoutWarning("mongodb://h/?connectTimeoutMS=2000", "7.0.1")
+	if w == "" || strings.Contains(w, "心跳") {
+		t.Errorf("7.0 warning should not mention the heartbeat:\n%s", w)
+	}
+	for _, uri := range []string{"mongodb://h/", "mongodb://h/?connectTimeoutMS=10000", "mongodb://h/?connectTimeoutMS=0", "mongodb://h/?CONNECTTIMEOUTMS=30000"} {
+		if w := ConnectTimeoutWarning(uri, "4.0.28"); w != "" {
+			t.Errorf("%s should not warn:\n%s", uri, w)
+		}
+	}
+	if ConnectTimeoutWarning("mongodb://h/?CONNECTTIMEOUTMS=500", "") == "" {
+		t.Error("option names are case-insensitive")
+	}
+}

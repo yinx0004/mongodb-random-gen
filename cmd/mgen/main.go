@@ -228,6 +228,9 @@ func newRun() *cobra.Command {
 				if err != nil {
 					return sink.ErrConnect(u, err)
 				}
+				if w := sink.ConnectTimeoutWarning(u, m.ServerVersion); w != "" {
+					fmt.Fprintln(os.Stderr, w)
+				}
 				s, hintURI = m, u
 			}
 
