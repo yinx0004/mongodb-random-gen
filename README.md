@@ -18,6 +18,18 @@ users:
 
 支持 MongoDB 4.0 及以上（已实测 4.0、4.4、7.0、8.0）。
 
+**直接下载**：在 [Releases](https://github.com/yinx0004/mongodb-random-gen/releases/latest) 下载对应系统的压缩包（Linux / macOS / Windows，amd64 / arm64），解压即可使用，不需要安装 Go。
+
+```bash
+# 例：Linux amd64
+curl -L https://github.com/yinx0004/mongodb-random-gen/releases/download/v0.1.0/mgen_0.1.0_linux_amd64.tar.gz | tar xz
+./mgen_0.1.0_linux_amd64/mgen --version
+```
+
+macOS 用浏览器下载时，如果提示「无法验证开发者」，执行一次 `xattr -d com.apple.quarantine mgen` 即可。
+
+**用 Go 安装**：
+
 ```bash
 go install github.com/yinx0004/mongodb-random-gen/cmd/mgen@latest   # 需要 Go 1.25+，命令名为 mgen
 ```
@@ -139,9 +151,9 @@ users:                           # 除了 uri / db / locale，顶层的每个键
 
 ## 路线图
 
-- [x] M1：基础写法、中英文数据、`run` / `preview` / `types` / `init` / `--out`；并发写入、写入确认级别；连接预热、自动重试、超时设置提示
+- [x] M1：基础写法、中英文数据、`run` / `preview` / `types` / `init` / `--out`；并发写入、写入确认级别；连接预热、自动重试、超时设置提示；预编译二进制（v0.1.0）
 - [ ] M2：数组、缺失率/空值率、唯一值、跨集合引用（`ref`）、索引、随机种子
-- [ ] M3：根据样例文档或线上集合自动推断配置（`mgen like` / `mgen init --like`）、预编译二进制发布
+- [ ] M3：根据样例文档或线上集合自动推断配置（`mgen like` / `mgen init --like`）
 
 设计细节见 [DESIGN.md](DESIGN.md)。
 

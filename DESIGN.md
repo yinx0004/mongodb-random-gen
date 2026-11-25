@@ -201,3 +201,4 @@ orders:
 - **故障注入验证**：用一个 TCP 代理复现了“负载下握手变慢”（旧版本报出与用户相同的错误，新版本正常完成）和“频繁断连”（重试后条数精确）。
 - **开跑前的 connectTimeoutMS 警告**：连接后用 `buildInfo` 取服务端版本。连接串里 `connectTimeoutMS` 小于 10000 时，先在 stderr 打一条警告，不中断运行；服务端低于 4.4 时，额外说明心跳超时也等于它（驱动源码 `getHeartbeatTimeout`：不支持流式心跳的服务端，心跳超时 = connectTimeoutMS）。README 里解释了长连接为什么还会新建（并发需要多条连接、连接池被清空、心跳超时）。
 
+- **v0.1.0 发布**：先手工交叉编译 linux / darwin / windows × amd64 / arm64 共 6 个包（`CGO_ENABLED=0 -trimpath -ldflags "-s -w"`，每个包含 mgen、LICENSE、README），附 `checksums.txt`（sha256），上传到 GitHub Release。goreleaser、Homebrew tap 仍留在 M3。
