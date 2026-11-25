@@ -202,3 +202,27 @@ orders:
 - **开跑前的 connectTimeoutMS 警告**：连接后用 `buildInfo` 取服务端版本。连接串里 `connectTimeoutMS` 小于 10000 时，先在 stderr 打一条警告，不中断运行；服务端低于 4.4 时，额外说明心跳超时也等于它（驱动源码 `getHeartbeatTimeout`：不支持流式心跳的服务端，心跳超时 = connectTimeoutMS）。README 里解释了长连接为什么还会新建（并发需要多条连接、连接池被清空、心跳超时）。
 
 - **v0.1.0 发布**：先手工交叉编译 linux / darwin / windows × amd64 / arm64 共 6 个包（`CGO_ENABLED=0 -trimpath -ldflags "-s -w"`，每个包含 mgen、LICENSE、README），附 `checksums.txt`（sha256），上传到 GitHub Release。goreleaser、Homebrew tap 仍留在 M3。
+- **在 macOS 上手工打包的注意事项**：macOS 自带的 tar（bsdtar）默认会把扩展属性（如 `com.apple.provenance`）打进包里，一部分变成 `._xxx` 文件（AppleDouble），一部分变成 pax 扩展头。Linux 上用 GNU tar 解压时会报 `Ignoring unknown extended header keyword`，还会多出 `._` 文件（v0.1.0 第一次上传时就出现了，已替换）。手工发版的步骤：
+
+  ```bash
+  V=0.1.0   # 和 cmd/mgen/main.go 里的 version 保持一致
+  for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+    os=${t%/*}; arch=${t#*/}; name=mgen_${V}_${os}_${arch}; ext=; [ $os = windows ] && ext=.exe
+    mkdir -p dist/$name
+    CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$V" -o dist/$name/mgen$ext ./cmd/mgen
+    cp LICENSE README.md dist/$name/
+    xattr -rc dist/$name
+    if [ $os = windows ]; then
+      (cd dist && zip -qrX $name.zip $name)
+    else
+      (cd dist && COPYFILE_DISABLE=1 tar --format ustar --no-mac-metadata --no-xattrs \
+          --uid 0 --gid 0 --uname root --gname root -czf $name.tar.gz $name)
+    fi
+    rm -rf dist/$name
+  done
+  (cd dist && shasum -a 256 mgen_* > checksums.txt)
+  ```
+
+  - `COPYFILE_DISABLE=1`：不生成 `._` 文件；`--no-mac-metadata --no-xattrs`：不写扩展属性；`--format ustar`：用最普通的 tar 格式，没有 pax 扩展头；属主统一为 root。zip 用 `-X` 不存额外属性，也不会生成 `__MACOSX` 目录（那是 Finder「压缩」才会加的）。
+  - 发布前检查：`tar tzf` 里不能有 `._` 开头的条目；在 Linux 容器里用 GNU tar 解压不能有警告，并运行 `mgen --version`；`shasum -a 256 -c checksums.txt` 全部 OK。
+  - 发布：先打带注释的 tag 并推送，再 `gh release create vX.Y.Z --verify-tag --notes-file <说明> dist/*`；替换已上传的文件用 `gh release upload vX.Y.Z --clobber`。

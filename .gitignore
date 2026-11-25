@@ -1,3 +1,4 @@
 bin/
 /mgen
 *.jsonl
+dist/
